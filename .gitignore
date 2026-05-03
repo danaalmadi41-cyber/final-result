@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+edge-profile/
+crowd.db
+crowd_clean.db
+crowd_recovered.db
+crowd_recovered_check.db
+*.db-journal*
+_codex_*/
+_codex_*.db
+uploads/
+
+.env
+.venv/
+venv/
