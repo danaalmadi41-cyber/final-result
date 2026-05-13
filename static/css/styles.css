@@ -378,7 +378,7 @@
   }
   
   .nav-logo { display: flex; align-items: center; gap: 10px; text-decoration: none; }
-  .nav-logo img { height: 36px; }
+  .nav-logo img { height: 44px; }
   .nav-link {
     font-family: 'Montserrat', sans-serif; font-weight: 600; font-size: 13px; color: var(--muted);
     text-decoration: none; padding: 6px 12px; border-radius: 8px;
@@ -394,7 +394,7 @@
     display: flex; flex-direction: column; padding: 24px 0;
   }
   .sidebar-logo { padding: 0 20px 24px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
-  .sidebar-logo img { height: 36px; }
+  .sidebar-logo img { height: 44px; }
   .sidebar-item {
     display: flex; align-items: center; gap: 12px; padding: 11px 20px;
     font-family: 'Montserrat', sans-serif; font-weight: 600; font-size: 13px;
@@ -1808,8 +1808,8 @@ body.light-mode .top-user-avatar {
 
     /* Top nav logo */
     .top-nav-logo-img {
-      width: 52px !important;
-      height: 52px !important;
+      width: 72px !important;
+      height: 72px !important;
     }
   }
 

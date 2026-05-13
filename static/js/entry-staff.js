@@ -279,7 +279,7 @@ function renderScan() {
       /* Row 1: logo + title | icon actions */
       '<div style="height:56px;display:flex;align-items:center;justify-content:space-between;">' +
         '<div style="display:flex;align-items:center;gap:10px;min-width:0;">' +
-          '<img src="' + LOGO + '" alt="Crowd Analyzing" style="height:28px;flex-shrink:0;" />' +
+          '<img src="' + LOGO + '" alt="Crowd Analyzing" style="height:36px;flex-shrink:0;" />' +
           '<div style="min-width:0;">' +
             '<div style="font-family:\'Montserrat\',sans-serif;font-weight:800;font-size:13px;line-height:1.2;">Staff Portal</div>' +
             '<div style="font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + staffName + '</div>' +
@@ -1109,7 +1109,7 @@ function renderStaffSettings() {
   return '<div style="min-height:100vh;background:var(--dark);display:flex;flex-direction:column;">' +
     '<header style="background:var(--dark2);border-bottom:1px solid var(--border);padding:0 24px;height:64px;display:flex;align-items:center;justify-content:space-between;">' +
       '<div style="display:flex;align-items:center;gap:12px;">' +
-        '<img src="' + LOGO + '" alt="Crowd Analyzing" style="height:32px;" />' +
+        '<img src="' + LOGO + '" alt="Crowd Analyzing" style="height:40px;" />' +
         '<div style="width:1px;height:24px;background:var(--border);"></div>' +
         '<div style="font-family:\'Montserrat\',sans-serif;font-weight:700;font-size:13px;">Staff Settings</div>' +
       '</div>' +

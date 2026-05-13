@@ -32,7 +32,7 @@ function renderSignup() {
     '<div style="position:absolute;inset:0;background:radial-gradient(ellipse 700px 500px at 70% 50%,rgba(155,16,64,0.1) 0%,transparent 70%),radial-gradient(ellipse 500px 400px at 30% 40%,rgba(255,180,0,0.07) 0%,transparent 60%);pointer-events:none;"></div>' +
     '<div class="card" style="width:100%;max-width:460px;padding:36px;position:relative;z-index:1;background:rgba(255,255,255,0.06);backdrop-filter:blur(16px);">' +
       '<div style="text-align:center;margin-bottom:28px;">' +
-        '<img src="' + LOGO + '" alt="Crowd Analyzing" style="height:50px;margin-bottom:16px;" />' +
+        '<img src="' + LOGO + '" alt="Crowd Analyzing" style="height:64px;margin-bottom:16px;" />' +
         '<h1 style="font-family:\'Montserrat\',sans-serif;font-weight:800;font-size:22px;margin-bottom:6px;">Create Account</h1>' +
         '<p style="color:var(--muted);font-size:14px;">Join Crowd Analyzing and discover smarter events</p>' +
       '</div>' +

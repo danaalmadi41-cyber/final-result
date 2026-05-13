@@ -17,7 +17,7 @@ function renderTopNav() {
 
       '<div style="display:flex;align-items:center;gap:14px;">' +
         '<button onclick="navigate(\'home\')" style="background:none;border:none;padding:0;cursor:pointer;display:flex;align-items:center;">' +
-          '<img src="' + LOGO + '" alt="logo" class="top-nav-logo-img" style="width:62px;height:62px;object-fit:contain;display:block;" />' +
+          '<img src="' + LOGO + '" alt="logo" class="top-nav-logo-img" style="width:104px;height:104px;object-fit:contain;display:block;" />' +
         '</button>' +
 
         '<nav class="top-nav-nav-links" style="display:flex;align-items:center;gap:8px;">' +
@@ -182,7 +182,7 @@ function renderSidebar(active) {
       // ===== TOP =====
       '<div>' +
         '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:26px;padding:6px 8px;">' +
-          '<img src="' + LOGO + '" alt="logo" style="width:42px;height:42px;object-fit:contain;" />' +
+          '<img src="' + LOGO + '" alt="logo" style="width:52px;height:52px;object-fit:contain;" />' +
           '<button onclick="closeMobileSidebar()" style="display:none;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);' +
           'border-radius:8px;color:#fff;font-size:18px;width:32px;height:32px;cursor:pointer;' +
           'align-items:center;justify-content:center;flex-shrink:0;" class="mob-close-sidebar-btn">×</button>' +

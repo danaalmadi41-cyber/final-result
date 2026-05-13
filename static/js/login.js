@@ -12,7 +12,9 @@ function renderLogin() {
 
     '<div class="card" style="width:100%;max-width:420px;padding:36px;position:relative;z-index:1;background:rgba(255,255,255,0.06);backdrop-filter:blur(16px);">' +
       '<div style="text-align:center;margin-bottom:28px;">' +
-        '<img src="' + LOGO + '" alt="Crowd Analyzing" style="height:50px;margin-bottom:16px;" />' +
+        '<div style="display:flex;justify-content:center;align-items:center;margin-bottom:18px;">' +
+          '<img src="' + LOGO + '" alt="Crowd Analyzing" style="display:block;width:112px;max-width:34vw;height:auto;" />' +
+        '</div>' +
         '<h1 style="font-family:\'Montserrat\',sans-serif;font-weight:800;font-size:22px;margin-bottom:6px;">Welcome Back</h1>' +
         '<p style="color:var(--muted);font-size:14px;">Sign in to continue to Crowd Analyzing</p>' +
       '</div>' +
