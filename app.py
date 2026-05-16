@@ -396,6 +396,43 @@ def migrate_legacy_utc_timestamps(cur):
     """, (migration_key, current_timestamp()))
 
 
+def migrate_day_stats_from_actual_scan_dates(cur):
+    """Rebuild event_day_stats.attendance_count from actual scan entry_time dates.
+
+    Historical scans were written to event_day_stats using the ticket's
+    attendance_date (future date) instead of the real scan date.  This
+    migration corrects that by re-counting from the attendance table.
+    It runs once, tracked by app_meta key.
+    """
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    migration_key = 'day_stats_rebuilt_from_scan_dates_v1'
+    cur.execute("SELECT value FROM app_meta WHERE key = ?", (migration_key,))
+    if cur.fetchone():
+        return
+
+    # Reset all attendance counts — tickets_sold is kept as-is.
+    cur.execute("UPDATE event_day_stats SET attendance_count = 0")
+
+    # Re-count from real scan dates recorded in attendance.entry_time.
+    cur.execute("""
+        INSERT INTO event_day_stats (event_id, event_date, tickets_sold, attendance_count)
+        SELECT event_id, DATE(entry_time), 0, COUNT(*)
+        FROM attendance
+        GROUP BY event_id, DATE(entry_time)
+        ON CONFLICT(event_id, event_date) DO UPDATE SET attendance_count = excluded.attendance_count
+    """)
+
+    cur.execute("""
+        INSERT OR REPLACE INTO app_meta (key, value) VALUES (?, ?)
+    """, (migration_key, current_timestamp()))
+
+
 # ============================================================
 #  DATABASE CONNECTION
 # ============================================================
@@ -605,6 +642,35 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    try:
+        cur.execute("ALTER TABLE events ADD COLUMN capacity_per_day INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+
+    # Migrate existing multi-day events: capacity_per_day = capacity
+    cur.execute("""
+        UPDATE events
+        SET capacity_per_day = capacity
+        WHERE end_date IS NOT NULL
+          AND end_date != start_date
+          AND capacity_per_day = 0
+    """)
+
+    # ============================================================
+    #  EVENT DAY STATS TABLE
+    # ============================================================
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS event_day_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_id INTEGER NOT NULL,
+        event_date TEXT NOT NULL,
+        tickets_sold INTEGER NOT NULL DEFAULT 0,
+        attendance_count INTEGER NOT NULL DEFAULT 0,
+        UNIQUE(event_id, event_date),
+        FOREIGN KEY (event_id) REFERENCES events(id)
+    )
+    """)
+
     # ============================================================
     #  ENTRY STAFF PROFILES TABLE
     # ============================================================
@@ -691,6 +757,9 @@ def init_db():
             END
         """)
 
+    if "attendance_date" not in ticket_purchase_columns:
+        cur.execute("ALTER TABLE ticket_purchases ADD COLUMN attendance_date TEXT")
+
     # ============================================================
     #  NOTIFICATION PREFERENCES TABLE
     # ============================================================
@@ -751,6 +820,7 @@ def init_db():
     """)
 
     migrate_legacy_utc_timestamps(cur)
+    migrate_day_stats_from_actual_scan_dates(cur)
 
     # ============================================================
     #  CHAT MESSAGES TABLE
@@ -1342,30 +1412,50 @@ def build_customer_crowd_alert(event_name, attendance_count, capacity):
     if current_count >= max_capacity:
         return {
             "stage": "full",
-            "title": "الايفنت صار مليان",
-            "message": 'ترا الايفنت "' + str(event_name or 'الفعالية') + '" صار مليان.\nالعدد الحالي: ' + attendance_summary + '.'
+            "title": "Event is Full",
+            "message": 'The event "' + str(event_name or 'Event') + '" is now at full capacity.\nCurrent attendance: ' + attendance_summary + '.'
         }
 
     if percentage >= 80:
         return {
             "stage": "near_full",
-            "title": "قرب يمتلئ",
-            "message": 'ترا قرب أكثر للزحمة في "' + str(event_name or 'الفعالية') + '".\nالعدد الحالي: ' + attendance_summary + '.'
+            "title": "Almost Full",
+            "message": 'The event "' + str(event_name or 'Event') + '" is getting very crowded.\nCurrent attendance: ' + attendance_summary + '.'
         }
 
-    if percentage > 50:
+    if percentage >= 50:
         return {
             "stage": "busy",
-            "title": "بدأ يصير زحمة",
-            "message": 'ترا بدأ يصير زحمة في "' + str(event_name or 'الفعالية') + '".\nالعدد الحالي: ' + attendance_summary + '.'
+            "title": "Getting Busy",
+            "message": 'The event "' + str(event_name or 'Event') + '" is starting to get crowded.\nCurrent attendance: ' + attendance_summary + '.'
         }
 
     return None
 
 
-def build_staff_alert_state(event_row):
-    attendance_count = int(event_row["attendance_count"] or 0)
-    capacity = int(event_row["capacity"] or 0)
+def get_today_event_stats(event_id, event_row, cur):
+    """Return today's real scan count from event_day_stats for any event type."""
+    today_str = get_local_now_naive().strftime('%Y-%m-%d')
+    capacity_per_day = int(event_row["capacity_per_day"] or 0) if "capacity_per_day" in event_row.keys() else 0
+    # Always query event_day_stats for today — never fall back to global attendance_count
+    cur.execute(
+        "SELECT attendance_count FROM event_day_stats WHERE event_id = ? AND event_date = ?",
+        (event_id, today_str)
+    )
+    day_row = cur.fetchone()
+    today_attendance = int(day_row["attendance_count"] or 0) if day_row else 0
+    today_capacity = capacity_per_day if capacity_per_day > 0 else int(event_row["capacity"] or 0)
+    return {
+        "today_date": today_str,
+        "today_attendance": today_attendance,
+        "today_capacity": today_capacity,
+        "is_multi_day": capacity_per_day > 0
+    }
+
+
+def build_staff_alert_state(event_row, today_attendance=None, today_capacity=None):
+    attendance_count = today_attendance if today_attendance is not None else int(event_row["attendance_count"] or 0)
+    capacity = today_capacity if today_capacity is not None else int(event_row["capacity"] or 0)
     crowd_level = calculate_crowd_level(attendance_count, capacity)
     emergency_active = bool(event_row["emergency_active"]) if "emergency_active" in event_row.keys() else False
     emergency_type = str(event_row["emergency_type"] or "").strip().lower() if "emergency_type" in event_row.keys() else ""
@@ -1512,7 +1602,8 @@ def validate_event_schedule(start_date, end_date, start_time, end_time, require_
     return start_dt, end_dt, None
 
 
-def get_event_runtime_status(event_row, now=None):
+def get_event_runtime_status(event_row, now=None, all_days_sold_out=False):
+    from datetime import date as date_cls
     now = now or get_local_now_naive()
     start_dt = parse_event_datetime(event_row["start_date"], event_row["start_time"])
     end_dt = parse_event_datetime(event_row["end_date"] or event_row["start_date"], event_row["end_time"])
@@ -1520,15 +1611,28 @@ def get_event_runtime_status(event_row, now=None):
     is_upcoming = bool(start_dt and now < start_dt)
     is_ended = bool(end_dt and now > end_dt)
     is_live = bool(start_dt and end_dt and start_dt <= now <= end_dt)
-    remaining_tickets = max(int(event_row["capacity"] or 0) - int(event_row["tickets_sold"] or 0), 0)
-    is_sold_out = remaining_tickets <= 0
+
+    capacity_per_day = int(event_row["capacity_per_day"] or 0) if "capacity_per_day" in event_row.keys() else 0
+    if capacity_per_day > 0:
+        try:
+            sd = date_cls.fromisoformat(event_row["start_date"])
+            ed = date_cls.fromisoformat(event_row["end_date"] or event_row["start_date"])
+            num_days = max((ed - sd).days + 1, 1)
+        except Exception:
+            num_days = 1
+        total_capacity = capacity_per_day * num_days
+    else:
+        total_capacity = int(event_row["capacity"] or 0)
+
+    remaining_tickets = max(total_capacity - int(event_row["tickets_sold"] or 0), 0) if total_capacity > 0 else None
+    is_sold_out = (total_capacity > 0 and remaining_tickets <= 0) or (capacity_per_day > 0 and all_days_sold_out)
     next_available_date = event_row["start_date"] or event_row["end_date"] or "TBA"
 
     home_status_message = ""
     if is_ended:
         home_status_message = "Event is ended"
-    elif is_sold_out:
-        home_status_message = "Event is sold out for today. Next available tickets on: " + str(next_available_date)
+    elif capacity_per_day > 0 and all_days_sold_out:
+        home_status_message = "All attendance dates are sold out"
 
     return {
         "start_dt": start_dt,
@@ -1537,6 +1641,7 @@ def get_event_runtime_status(event_row, now=None):
         "is_live": is_live,
         "is_ended": is_ended,
         "is_sold_out": is_sold_out,
+        "all_days_sold_out": all_days_sold_out,
         "remaining_tickets": remaining_tickets,
         "status": "ended" if is_ended else ("live" if is_live else "upcoming"),
         "home_status_message": home_status_message,
@@ -1544,9 +1649,9 @@ def get_event_runtime_status(event_row, now=None):
     }
 
 
-def serialize_event_row(row):
+def serialize_event_row(row, all_days_sold_out=False):
     prediction = build_crowd_prediction(row)
-    timing = get_event_runtime_status(row)
+    timing = get_event_runtime_status(row, all_days_sold_out=all_days_sold_out)
     staff_alert = build_staff_alert_state(row)
     return {
         "id": row["id"],
@@ -1561,6 +1666,7 @@ def serialize_event_row(row):
         "end_time": row["end_time"],
         "description": row["description"],
         "capacity": row["capacity"],
+        "capacity_per_day": int(row["capacity_per_day"]) if "capacity_per_day" in row.keys() else 0,
         "ticket_price": row["ticket_price"],
         "tickets_sold": row["tickets_sold"],
         "attendance_count": row["attendance_count"],
@@ -1573,6 +1679,7 @@ def serialize_event_row(row):
         "is_live": timing["is_live"],
         "is_ended": timing["is_ended"],
         "is_sold_out": timing["is_sold_out"],
+        "all_days_sold_out": timing["all_days_sold_out"],
         "home_status_message": timing["home_status_message"],
         "next_available_date": timing["next_available_date"],
         "emergency_active": bool(row["emergency_active"]) if "emergency_active" in row.keys() else False,
@@ -1898,10 +2005,17 @@ def build_ticket_card_html(index, total, code, event_name):
     """
 
 
-def build_crowd_prediction(event_row):
-    capacity = int(event_row["capacity"] or 0)
-    tickets_sold = int(event_row["tickets_sold"] or 0)
-    attendance_count = int(event_row["attendance_count"] or 0)
+def build_crowd_prediction(event_row, today_attendance=None, today_capacity=None, today_tickets_sold=None):
+    capacity_per_day = int(event_row["capacity_per_day"] or 0) if "capacity_per_day" in event_row.keys() else 0
+    if today_attendance is not None:
+        # Use today-scoped data for all events so predictions respect the current day
+        attendance_count = today_attendance
+        capacity = today_capacity if today_capacity is not None else (capacity_per_day if capacity_per_day > 0 else int(event_row["capacity"] or 0))
+        tickets_sold = today_tickets_sold if today_tickets_sold is not None else int(event_row["tickets_sold"] or 0)
+    else:
+        capacity = int(event_row["capacity"] or 0)
+        tickets_sold = int(event_row["tickets_sold"] or 0)
+        attendance_count = int(event_row["attendance_count"] or 0)
     start_dt = parse_event_datetime(event_row["start_date"], event_row["start_time"])
     end_dt = parse_event_datetime(event_row["end_date"] or event_row["start_date"], event_row["end_time"])
     now = get_local_now_naive()
@@ -3373,6 +3487,7 @@ def review_organizer_application_from_email():
 @app.route('/api/events', methods=['GET'])
 def get_events():
     try:
+        from datetime import date as date_cls, timedelta
         conn = get_db_connection()
         cur = conn.cursor()
 
@@ -3385,9 +3500,58 @@ def get_events():
             ORDER BY e.id DESC
         """)
         rows = cur.fetchall()
+
+        today_str = get_local_now_naive().strftime('%Y-%m-%d')
+        cur.execute("SELECT event_id, event_date, tickets_sold, attendance_count FROM event_day_stats")
+        day_stats_map = {}
+        day_stats_full = {}
+        today_att_map = {}
+        for r in cur.fetchall():
+            eid = int(r["event_id"])
+            day_stats_map.setdefault(eid, {})[r["event_date"]] = int(r["tickets_sold"] or 0)
+            day_stats_full.setdefault(eid, {})[r["event_date"]] = {
+                "tickets_sold": int(r["tickets_sold"] or 0),
+                "attendance_count": int(r["attendance_count"] or 0)
+            }
+            if r["event_date"] == today_str:
+                today_att_map[eid] = int(r["attendance_count"] or 0)
+
         conn.close()
 
-        events = [serialize_event_row(row) for row in rows]
+        all_days_sold_out_map = {}
+        for row in rows:
+            cpd = int(row["capacity_per_day"] or 0)
+            if cpd > 0 and row["start_date"] and row["end_date"] and row["start_date"] != row["end_date"]:
+                try:
+                    sd = date_cls.fromisoformat(row["start_date"])
+                    ed = date_cls.fromisoformat(row["end_date"])
+                    day_map = day_stats_map.get(row["id"], {})
+                    current = sd
+                    all_sold = True
+                    while current <= ed:
+                        if day_map.get(current.isoformat(), 0) < cpd:
+                            all_sold = False
+                            break
+                        current += timedelta(days=1)
+                    all_days_sold_out_map[row["id"]] = all_sold
+                except Exception:
+                    all_days_sold_out_map[row["id"]] = False
+
+        events = []
+        for row in rows:
+            cpd = int(row["capacity_per_day"] or 0) if "capacity_per_day" in row.keys() else 0
+            # Always use event_day_stats for today's count — never global attendance_count
+            today_att = today_att_map.get(int(row["id"]), 0)
+            today_cap = cpd if cpd > 0 else int(row["capacity"] or 0)
+            today_ts = day_stats_full.get(int(row["id"]), {}).get(today_str, {}).get("tickets_sold", 0)
+            event_data = serialize_event_row(row, all_days_sold_out=all_days_sold_out_map.get(row["id"], False))
+            event_data["today_attendance_count"] = today_att
+            event_data["today_capacity"] = today_cap
+            event_data["today_date"] = today_str
+            event_data["day_stats"] = day_stats_full.get(int(row["id"]), {})
+            event_data["prediction"] = build_crowd_prediction(row, today_attendance=today_att, today_capacity=today_cap, today_tickets_sold=today_ts)
+            event_data["crowd_level"] = calculate_crowd_level(today_att, today_cap)
+            events.append(event_data)
 
         return jsonify(events)
 
@@ -3416,9 +3580,51 @@ def get_organizer_events(user_id):
     """, (user_id,))
 
     rows = cur.fetchall()
+
+    today_str = get_local_now_naive().strftime('%Y-%m-%d')
+    event_ids = [row["id"] for row in rows]
+    today_att_map = {}
+    day_stats_full = {}
+    if event_ids:
+        placeholders = ','.join('?' * len(event_ids))
+        cur.execute(
+            f"SELECT event_id, event_date, tickets_sold, attendance_count FROM event_day_stats WHERE event_id IN ({placeholders})",
+            event_ids
+        )
+        for r in cur.fetchall():
+            eid = int(r["event_id"])
+            day_stats_full.setdefault(eid, {})[r["event_date"]] = {
+                "tickets_sold": int(r["tickets_sold"] or 0),
+                "attendance_count": int(r["attendance_count"] or 0)
+            }
+            if r["event_date"] == today_str:
+                today_att_map[eid] = int(r["attendance_count"] or 0)
+
     conn.close()
 
-    events = [serialize_event_row(row) for row in rows]
+    events = []
+    for row in rows:
+        cpd = int(row["capacity_per_day"] or 0) if "capacity_per_day" in row.keys() else 0
+        # Always use event_day_stats for today's count — never global attendance_count
+        today_att = today_att_map.get(int(row["id"]), 0)
+        today_cap = cpd if cpd > 0 else int(row["capacity"] or 0)
+        today_ts = day_stats_full.get(int(row["id"]), {}).get(today_str, {}).get("tickets_sold", 0)
+        event_data = serialize_event_row(row)
+        event_data["today_attendance_count"] = today_att
+        event_data["today_capacity"] = today_cap
+        event_data["today_date"] = today_str
+        event_data["day_stats"] = day_stats_full.get(int(row["id"]), {})
+        event_data["prediction"] = build_crowd_prediction(row, today_attendance=today_att, today_capacity=today_cap, today_tickets_sold=today_ts)
+        event_data["crowd_level"] = calculate_crowd_level(today_att, today_cap)
+        today_alert = build_staff_alert_state(row, today_attendance=today_att, today_capacity=today_cap)
+        event_data["staff_alert_active"] = today_alert["active"]
+        event_data["staff_alert_type"] = today_alert["type"]
+        event_data["staff_alert_severity"] = today_alert["severity"]
+        event_data["staff_alert_title"] = today_alert["title"]
+        event_data["staff_alert_message"] = today_alert["message"]
+        event_data["entry_locked"] = today_alert["entry_locked"]
+        event_data["entry_lock_reason"] = today_alert["entry_lock_reason"]
+        events.append(event_data)
 
     return jsonify(events)
 
@@ -3837,15 +4043,27 @@ def get_staff_events(staff_user_id):
         ORDER BY e.id DESC
     """, (staff_user_id,))
     rows = cur.fetchall()
-    conn.close()
 
+    today_str_staff = get_local_now_naive().strftime('%Y-%m-%d')
     events = []
     for row in rows:
         event_data = serialize_event_row(row)
+        today_stats = get_today_event_stats(row["id"], row, cur)
+        event_data["today_attendance_count"] = today_stats["today_attendance"]
+        event_data["today_capacity"] = today_stats["today_capacity"]
+        event_data["today_date"] = today_stats["today_date"]
+        # Crowd level and prediction always reflect today's real scan count
+        event_data["crowd_level"] = calculate_crowd_level(today_stats["today_attendance"], today_stats["today_capacity"])
+        cur.execute("SELECT tickets_sold FROM event_day_stats WHERE event_id = ? AND event_date = ?", (row["id"], today_str_staff))
+        ts_row = cur.fetchone()
+        today_ts_staff = int(ts_row["tickets_sold"] or 0) if ts_row else 0
+        event_data["prediction"] = build_crowd_prediction(row, today_attendance=today_stats["today_attendance"], today_capacity=today_stats["today_capacity"], today_tickets_sold=today_ts_staff)
+
         staff_status_meta = get_staff_work_status_meta(row["work_status"], row["name"])
         event_data["staff_work_status"] = staff_status_meta["status"]
         event_data["staff_work_status_label"] = staff_status_meta["label"]
         event_data["staff_status_updated_at"] = row["status_updated_at"]
+
         if staff_status_meta["status"] == 'extra_work':
             event_data["staff_alert_active"] = True
             event_data["staff_alert_type"] = 'staff_status'
@@ -3860,8 +4078,23 @@ def get_staff_events(staff_user_id):
             event_data["staff_alert_message"] = staff_status_meta["message"]
             event_data["entry_locked"] = True
             event_data["entry_lock_reason"] = staff_status_meta["status"]
+        else:
+            today_alert = build_staff_alert_state(
+                row,
+                today_attendance=today_stats["today_attendance"],
+                today_capacity=today_stats["today_capacity"]
+            )
+            event_data["staff_alert_active"] = today_alert["active"]
+            event_data["staff_alert_type"] = today_alert["type"]
+            event_data["staff_alert_severity"] = today_alert["severity"]
+            event_data["staff_alert_title"] = today_alert["title"]
+            event_data["staff_alert_message"] = today_alert["message"]
+            event_data["entry_locked"] = today_alert["entry_locked"]
+            event_data["entry_lock_reason"] = today_alert["entry_lock_reason"]
+
         events.append(event_data)
 
+    conn.close()
     return jsonify(events)
 
 
@@ -4173,6 +4406,7 @@ def chat_delete_messages(room_id):
 
 @app.route('/api/events', methods=['POST'])
 def create_event():
+    from datetime import date as date_cls
     data = request.get_json() or {}
 
     category = data.get('category', 'event')
@@ -4217,6 +4451,10 @@ def create_event():
         if ticket_price < 0:
             return jsonify({"message": "Ticket price cannot be negative"}), 400
 
+        # For multi-day events, capacity means per-day; track it in capacity_per_day
+        is_multi_day = end_date and end_date != start_date
+        capacity_per_day = capacity if is_multi_day else 0
+
         conn = get_db_connection()
         cur = conn.cursor()
 
@@ -4227,9 +4465,10 @@ def create_event():
         cur.execute("""
             INSERT INTO events (
                 organizer_id, name, location, city, start_date, end_date,
-                start_time, end_time, description, capacity, ticket_price, category
+                start_time, end_time, description, capacity, ticket_price, category,
+                capacity_per_day
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             organizer_id,
             name,
@@ -4242,7 +4481,8 @@ def create_event():
             description,
             capacity,
             ticket_price,
-            category
+            category,
+            capacity_per_day
         ))
 
         event_id = cur.lastrowid
@@ -4334,6 +4574,9 @@ def update_event(event_id):
         organizer_id = int(organizer_id)
         capacity = int(capacity)
         ticket_price = float(ticket_price or 0)
+
+        is_multi_day = end_date and end_date != start_date
+        capacity_per_day = capacity if is_multi_day else 0
         _, _, schedule_error = validate_event_schedule(
             start_date,
             end_date,
@@ -4370,11 +4613,22 @@ def update_event(event_id):
             conn.close()
             return jsonify({"message": "You can only edit your own events"}), 403
 
-        if capacity < int(event["tickets_sold"] or 0):
+        if is_multi_day:
+            from datetime import date as date_cls
+            try:
+                sd = date_cls.fromisoformat(start_date)
+                ed = date_cls.fromisoformat(end_date)
+                total_capacity = capacity * max((ed - sd).days + 1, 1)
+            except Exception:
+                total_capacity = capacity
+        else:
+            total_capacity = capacity
+
+        if total_capacity < int(event["tickets_sold"] or 0):
             conn.close()
             return jsonify({"message": "Capacity cannot be lower than tickets already sold"}), 400
 
-        if capacity < int(event["attendance_count"] or 0):
+        if total_capacity < int(event["attendance_count"] or 0):
             conn.close()
             return jsonify({"message": "Capacity cannot be lower than recorded attendance"}), 400
 
@@ -4391,7 +4645,8 @@ def update_event(event_id):
                 start_time = ?,
                 end_time = ?,
                 capacity = ?,
-                ticket_price = ?
+                ticket_price = ?,
+                capacity_per_day = ?
             WHERE id = ?
         """, (
             name,
@@ -4405,6 +4660,7 @@ def update_event(event_id):
             end_time,
             capacity,
             ticket_price,
+            capacity_per_day,
             event_id
         ))
 
@@ -4432,6 +4688,57 @@ def update_event(event_id):
         print(f"[Event update] Error: {e}")
         return jsonify({"message": f"Error updating event: {str(e)}"}), 500
 
+
+# ============================================================
+#  EVENT DAYS (per-day capacity breakdown)
+# ============================================================
+
+@app.route('/api/events/<int:event_id>/days', methods=['GET'])
+def get_event_days(event_id):
+    from datetime import date as date_cls, timedelta
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM events WHERE id = ?", (event_id,))
+    event = cur.fetchone()
+    if not event:
+        conn.close()
+        return jsonify({"message": "Event not found"}), 404
+
+    capacity_per_day = int(event["capacity_per_day"] or 0) if "capacity_per_day" in event.keys() else 0
+    if capacity_per_day <= 0:
+        conn.close()
+        return jsonify({"capacity_per_day": 0, "days": []}), 200
+
+    start = date_cls.fromisoformat(event["start_date"])
+    end = date_cls.fromisoformat(event["end_date"] or event["start_date"])
+
+    cur.execute("""
+        SELECT event_date, tickets_sold, attendance_count
+        FROM event_day_stats WHERE event_id = ?
+    """, (event_id,))
+    day_map = {row["event_date"]: row for row in cur.fetchall()}
+    conn.close()
+
+    days = []
+    current = start
+    while current <= end:
+        date_str = current.isoformat()
+        row = day_map.get(date_str)
+        sold = int(row["tickets_sold"] if row else 0)
+        attended = int(row["attendance_count"] if row else 0)
+        remaining = max(capacity_per_day - sold, 0)
+        days.append({
+            "date": date_str,
+            "day_name": current.strftime("%A"),
+            "date_display": current.strftime("%d/%m/%Y"),
+            "tickets_sold": sold,
+            "attendance_count": attended,
+            "remaining": remaining,
+            "is_sold_out": remaining <= 0
+        })
+        current += timedelta(days=1)
+
+    return jsonify({"capacity_per_day": capacity_per_day, "days": days})
 
 
 # ============================================================
@@ -4509,12 +4816,28 @@ def scan_entry(event_id):
             "reason_code": "emergency_active"
         }), 423
 
-    if int(event["capacity"] or 0) > 0 and int(event["attendance_count"] or 0) >= int(event["capacity"] or 0):
+    capacity_per_day = int(event["capacity_per_day"] or 0) if "capacity_per_day" in event.keys() else 0
+    today_str = get_local_now_naive().strftime('%Y-%m-%d')
+    effective_today_capacity = capacity_per_day if capacity_per_day > 0 else int(event["capacity"] or 0)
+
+    # Always read today's real scan count from event_day_stats so Current View is per-day accurate
+    cur.execute(
+        "SELECT attendance_count FROM event_day_stats WHERE event_id = ? AND event_date = ?",
+        (event_id, today_str)
+    )
+    today_day_row = cur.fetchone()
+    today_att_before = int(today_day_row["attendance_count"] or 0) if today_day_row else 0
+
+    if effective_today_capacity > 0 and today_att_before >= effective_today_capacity:
         conn.close()
         return jsonify({
-            "message": "This event is full. No more attendees should be allowed to enter.",
+            "message": "Today's session is full. No more attendees should be allowed to enter today." if capacity_per_day > 0 else "This event is full. No more attendees should be allowed to enter.",
             "reason_code": "event_full"
         }), 423
+
+    prev_today_att_for_crowd = today_att_before
+    prev_effective_cap = effective_today_capacity
+    prev_crowd = calculate_crowd_level(today_att_before, effective_today_capacity)
 
     cur.execute("SELECT full_name, email FROM users WHERE id = ?", (event["organizer_id"],))
     organizer_contact = cur.fetchone()
@@ -4564,6 +4887,31 @@ def scan_entry(event_id):
         conn.close()
         return jsonify({"message": "Ticket not found", "reason_code": "ticket_not_found"}), 404
 
+    # Reject the scan when the ticket's booked attendance date does not match today
+    ticket_booked_date = purchase["attendance_date"] if "attendance_date" in purchase.keys() else None
+    if ticket_booked_date and ticket_booked_date != today_str:
+        conn.close()
+        return jsonify({
+            "message": f"This ticket is not valid for today. It is booked for {ticket_booked_date}.",
+            "reason_code": "ticket_wrong_date"
+        }), 400
+
+    # Definitive per-day capacity check using the ticket's own attendance_date
+    ticket_att_date_check = purchase["attendance_date"] if "attendance_date" in purchase.keys() else None
+    if ticket_att_date_check and capacity_per_day > 0:
+        cur.execute(
+            "SELECT attendance_count FROM event_day_stats WHERE event_id = ? AND event_date = ?",
+            (event_id, ticket_att_date_check)
+        )
+        ticket_day_row = cur.fetchone()
+        ticket_day_att = int(ticket_day_row["attendance_count"] or 0) if ticket_day_row else 0
+        if ticket_day_att >= capacity_per_day:
+            conn.close()
+            return jsonify({
+                "message": "The session for this ticket date is full. No more attendees should be allowed to enter.",
+                "reason_code": "event_full"
+            }), 423
+
     cur.execute("""
         SELECT id FROM attendance
         WHERE event_id = ? AND purchase_id = ?
@@ -4586,9 +4934,16 @@ def scan_entry(event_id):
         WHERE id = ?
     """, (purchase["id"],))
 
+    # Always record scan for today's date so every day has its own independent count
+    ticket_att_date = purchase["attendance_date"] if "attendance_date" in purchase.keys() else None
+    cur.execute("""
+        INSERT INTO event_day_stats (event_id, event_date, tickets_sold, attendance_count)
+        VALUES (?, ?, 0, 1)
+        ON CONFLICT(event_id, event_date) DO UPDATE SET attendance_count = attendance_count + 1
+    """, (event_id, today_str))
+
     # update attendance count
-    prev_crowd = calculate_crowd_level(event["attendance_count"], event["capacity"])
-    prev_customer_alert = build_customer_crowd_alert(event["name"], event["attendance_count"], event["capacity"])
+    prev_customer_alert = build_customer_crowd_alert(event["name"], prev_today_att_for_crowd, prev_effective_cap)
     new_count = event["attendance_count"] + 1
 
     cur.execute("""
@@ -4598,18 +4953,41 @@ def scan_entry(event_id):
     """, (new_count, event_id))
 
     conn.commit()
-    crowd = calculate_crowd_level(new_count, event["capacity"])
+
+    # Always read today's count from event_day_stats so the response matches the real scan count
+    cur.execute(
+        "SELECT attendance_count, tickets_sold FROM event_day_stats WHERE event_id = ? AND event_date = ?",
+        (event_id, today_str)
+    )
+    after_day_row = cur.fetchone()
+    today_att_count = int(after_day_row["attendance_count"] or 0) if after_day_row else 1
+    today_tickets_sold = int(after_day_row["tickets_sold"] or 0) if after_day_row else 0
+    crowd = calculate_crowd_level(today_att_count, effective_today_capacity)
+
     updated_event = dict(event)
     updated_event["attendance_count"] = new_count
     updated_event["crowd_level"] = crowd
-    prediction = build_crowd_prediction(updated_event)
-    staff_alert = build_staff_alert_state(updated_event)
+    prediction = build_crowd_prediction(
+        updated_event,
+        today_attendance=today_att_count,
+        today_capacity=effective_today_capacity,
+        today_tickets_sold=today_tickets_sold
+    )
+    staff_alert = build_staff_alert_state(
+        updated_event,
+        today_attendance=today_att_count,
+        today_capacity=effective_today_capacity
+    )
     conn.close()
 
     firebase_sync(f'events/{event_id}', {
         'attendance_count': new_count,
+        'today_attendance_count': today_att_count,
+        'today_capacity': effective_today_capacity,
+        'today_date': today_str,
         'crowd_level': crowd,
         'capacity': event['capacity'],
+        'capacity_per_day': capacity_per_day,
         'prediction': prediction,
         'staff_alert_active': staff_alert["active"],
         'staff_alert_type': staff_alert["type"],
@@ -4623,7 +5001,7 @@ def scan_entry(event_id):
         'emergency_message': event["emergency_message"] if "emergency_message" in event.keys() else ''
     }, method='PATCH')
 
-    customer_alert = build_customer_crowd_alert(event["name"], new_count, event["capacity"])
+    customer_alert = build_customer_crowd_alert(event["name"], today_att_count, effective_today_capacity)
     if customer_alert and (not prev_customer_alert or customer_alert["stage"] != prev_customer_alert["stage"]):
         conn2 = get_db_connection()
         cur2 = conn2.cursor()
@@ -4668,7 +5046,7 @@ def scan_entry(event_id):
                 """
             )
 
-    if crowd == 'High' and prev_crowd != 'High' and int(new_count) < int(event["capacity"] or 0):
+    if crowd == 'High' and prev_crowd != 'High' and today_att_count < effective_today_capacity:
         conn2 = get_db_connection()
         cur2 = conn2.cursor()
         cur2.execute("""
@@ -4735,12 +5113,12 @@ def scan_entry(event_id):
                 <div style="font-family:sans-serif;max-width:600px;margin:auto;padding:24px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;">
                   <h2 style="color:#9B1040;margin-top:0;">Crowd level updated</h2>
                   <p>The crowd level for <strong>{event['name']}</strong> changed from <strong>{prev_crowd}</strong> to <strong>{crowd}</strong>.</p>
-                  <p>Current attendance: <strong>{new_count} / {event['capacity']}</strong></p>
+                  <p>Current attendance: <strong>{today_att_count} / {effective_today_capacity}</strong></p>
                 </div>
                 """
             )
 
-    if int(event["capacity"] or 0) > 0 and int(new_count) >= int(event["capacity"] or 0) and int(event["attendance_count"] or 0) < int(event["capacity"] or 0):
+    if effective_today_capacity > 0 and today_att_count >= effective_today_capacity and prev_today_att_for_crowd < effective_today_capacity:
         conn3 = get_db_connection()
         cur3 = conn3.cursor()
         cur3.execute("""
@@ -4774,10 +5152,12 @@ def scan_entry(event_id):
         "ticket_status": "Done",
         "customer_name": purchase["full_name"],
         "attendance_count": new_count,
+        "today_attendance_count": today_att_count,
+        "today_capacity": effective_today_capacity,
         "crowd_level": crowd,
         "prediction": prediction,
         "tickets_sold": event["tickets_sold"],
-        "remaining_entries": max(event["capacity"] - new_count, 0),
+        "remaining_entries": max(effective_today_capacity - today_att_count, 0) if effective_today_capacity > 0 else 0,
         "staff_alert_active": staff_alert["active"],
         "staff_alert_type": staff_alert["type"],
         "staff_alert_severity": staff_alert["severity"],
@@ -4798,7 +5178,8 @@ def scan_entry(event_id):
 def best_visit_time(event_id):
     try:
         from ml_prediction import predict_best_visit_time
-        result = predict_best_visit_time(event_id)
+        target_date = request.args.get('date') or None
+        result = predict_best_visit_time(event_id, target_date=target_date)
         if not result:
             return jsonify({"message": "Event not found"}), 404
         return jsonify(result)
@@ -4813,10 +5194,12 @@ def best_visit_time(event_id):
 
 @app.route('/api/events/<int:event_id>/buy', methods=['POST'])
 def buy_ticket(event_id):
+    from datetime import date as date_cls
     data = request.get_json() or {}
     user_id = data.get('user_id')
     quantity = data.get('quantity', 1)
     crowd_alerts_enabled = data.get('crowd_alerts_enabled', True)
+    attendance_date = data.get('attendance_date')
 
     if not user_id:
         return jsonify({"message": "You must sign in as a customer to purchase a ticket"}), 401
@@ -4859,26 +5242,57 @@ def buy_ticket(event_id):
     cur.execute("SELECT full_name, email FROM users WHERE id = ?", (event["organizer_id"],))
     organizer_contact = cur.fetchone()
 
-    remaining_tickets = max(int(event["capacity"] or 0) - int(event["tickets_sold"] or 0), 0)
+    capacity_per_day = int(event["capacity_per_day"] or 0) if "capacity_per_day" in event.keys() else 0
 
-    # sold out check
-    if remaining_tickets <= 0:
-        conn.close()
-        return jsonify({"message": "Tickets are sold out"}), 400
+    if capacity_per_day > 0:
+        # Per-day capacity mode: require attendance_date
+        if not attendance_date:
+            conn.close()
+            return jsonify({"message": "Please select your attendance date before purchasing"}), 400
+        try:
+            att_d = date_cls.fromisoformat(attendance_date)
+            ev_start = date_cls.fromisoformat(event["start_date"])
+            ev_end = date_cls.fromisoformat(event["end_date"] or event["start_date"])
+            if att_d < ev_start or att_d > ev_end:
+                conn.close()
+                return jsonify({"message": "Selected date is outside the event range"}), 400
+        except Exception:
+            conn.close()
+            return jsonify({"message": "Invalid attendance date"}), 400
 
-    if quantity > remaining_tickets:
-        conn.close()
-        return jsonify({"message": f"Only {remaining_tickets} ticket(s) are still available"}), 400
+        cur.execute("""
+            SELECT tickets_sold FROM event_day_stats
+            WHERE event_id = ? AND event_date = ?
+        """, (event_id, attendance_date))
+        day_row = cur.fetchone()
+        day_sold = int(day_row["tickets_sold"] if day_row else 0)
+        day_remaining = max(capacity_per_day - day_sold, 0)
+
+        if day_remaining <= 0:
+            conn.close()
+            return jsonify({"message": "No tickets available for the selected date"}), 400
+        if quantity > day_remaining:
+            conn.close()
+            return jsonify({"message": f"Only {day_remaining} ticket(s) available for the selected date"}), 400
+    else:
+        # Standard total-capacity mode
+        remaining_tickets = max(int(event["capacity"] or 0) - int(event["tickets_sold"] or 0), 0)
+        if remaining_tickets <= 0:
+            conn.close()
+            return jsonify({"message": "Tickets are sold out"}), 400
+        if quantity > remaining_tickets:
+            conn.close()
+            return jsonify({"message": f"Only {remaining_tickets} ticket(s) are still available"}), 400
 
     purchase_ids = []
     for _ in range(quantity):
         cur.execute("""
-            INSERT INTO ticket_purchases (user_id, event_id, purchase_time, status)
-            VALUES (?, ?, app_now(), 'Active')
-        """, (user_id, event_id))
+            INSERT INTO ticket_purchases (user_id, event_id, purchase_time, status, attendance_date)
+            VALUES (?, ?, app_now(), 'Active', ?)
+        """, (user_id, event_id, attendance_date))
         purchase_ids.append(cur.lastrowid)
 
-    # update tickets sold
+    # update total tickets sold
     new_tickets_sold = int(event["tickets_sold"] or 0) + quantity
 
     cur.execute("""
@@ -4886,6 +5300,14 @@ def buy_ticket(event_id):
         SET tickets_sold = ?
         WHERE id = ?
     """, (new_tickets_sold, event_id))
+
+    # update per-day stats if applicable
+    if capacity_per_day > 0 and attendance_date:
+        cur.execute("""
+            INSERT INTO event_day_stats (event_id, event_date, tickets_sold, attendance_count)
+            VALUES (?, ?, ?, 0)
+            ON CONFLICT(event_id, event_date) DO UPDATE SET tickets_sold = tickets_sold + ?
+        """, (event_id, attendance_date, quantity, quantity))
 
     cur.execute("""
         INSERT INTO notification_preferences (user_email, crowd_alerts_enabled)
@@ -4899,7 +5321,19 @@ def buy_ticket(event_id):
     ticket_codes = [format_ticket_code(purchase_id) for purchase_id in purchase_ids]
     quantity_label = str(quantity) + " ticket" + ("" if quantity == 1 else "s")
     quantity_verb = "has" if quantity == 1 else "have"
-    sold_out_after_purchase = new_tickets_sold >= int(event["capacity"] or 0) and int(event["capacity"] or 0) > 0
+
+    if capacity_per_day > 0 and event["start_date"] and event["end_date"]:
+        try:
+            _sd = date_cls.fromisoformat(event["start_date"])
+            _ed = date_cls.fromisoformat(event["end_date"])
+            _num_days = max((_ed - _sd).days + 1, 1)
+            _total_cap = capacity_per_day * _num_days
+        except Exception:
+            _total_cap = int(event["capacity"] or 0)
+    else:
+        _total_cap = int(event["capacity"] or 0)
+
+    sold_out_after_purchase = _total_cap > 0 and new_tickets_sold >= _total_cap
 
     # notify customer
     create_notification(
@@ -4960,7 +5394,7 @@ def buy_ticket(event_id):
               <p>Hi <strong>{buyer['full_name']}</strong>, your {quantity_label} {quantity_verb} been booked successfully!</p>
               <table style="width:100%;border-collapse:collapse;margin:20px 0;">
                 <tr><td style="padding:10px;border:1px solid #e5e7eb;font-weight:600;background:#f9fafb;">Event</td><td style="padding:10px;border:1px solid #e5e7eb;">{event['name']}</td></tr>
-                <tr><td style="padding:10px;border:1px solid #e5e7eb;font-weight:600;background:#f9fafb;">Date</td><td style="padding:10px;border:1px solid #e5e7eb;">{event['start_date']} at {event['start_time']}</td></tr>
+                <tr><td style="padding:10px;border:1px solid #e5e7eb;font-weight:600;background:#f9fafb;">Date</td><td style="padding:10px;border:1px solid #e5e7eb;">{attendance_date or event['start_date']} at {event['start_time']}</td></tr>
                 <tr><td style="padding:10px;border:1px solid #e5e7eb;font-weight:600;background:#f9fafb;">Location</td><td style="padding:10px;border:1px solid #e5e7eb;">{event["location"] or 'TBA'}</td></tr>
                 <tr><td style="padding:10px;border:1px solid #e5e7eb;font-weight:600;background:#f9fafb;">Quantity</td><td style="padding:10px;border:1px solid #e5e7eb;">{quantity}</td></tr>
                 {ticket_rows_html}
@@ -5005,10 +5439,106 @@ def buy_ticket(event_id):
                 <div style="font-family:sans-serif;max-width:600px;margin:auto;padding:24px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;">
                   <h2 style="color:#9B1040;margin-top:0;">Event sold out</h2>
                   <p>Your event <strong>{event['name']}</strong> is now fully booked.</p>
-                  <p>Tickets sold: <strong>{new_tickets_sold} / {event['capacity']}</strong></p>
+                  <p>Tickets sold: <strong>{new_tickets_sold} / {_total_cap}</strong></p>
                 </div>
                 """
             )
+
+        _conn2 = get_db_connection()
+        _cur2 = _conn2.cursor()
+        _holders = get_crowd_alert_ticket_holders(event_id, _cur2)
+        _customer_emails = list(dict.fromkeys([r["email"] for r in _holders if r["email"]]))
+        _conn2.close()
+
+        if _customer_emails:
+            send_email(
+                to_list=_customer_emails,
+                subject=f"Sold Out - {event['name']}",
+                html_body=f"""
+                <div style="font-family:sans-serif;max-width:600px;margin:auto;padding:24px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;">
+                  <h2 style="color:#dc2626;margin-top:0;">This event is now sold out</h2>
+                  <p>All tickets for <strong>{event['name']}</strong> have been sold.</p>
+                  <p style="color:#6b7280;font-size:13px;">You received this because you have a ticket for this event.</p>
+                </div>
+                """
+            )
+
+    # For multi-day events: notify organizer when every attendance date reaches capacity
+    if capacity_per_day > 0 and attendance_date:
+        try:
+            from datetime import date as date_cls, timedelta
+            _sd = date_cls.fromisoformat(event["start_date"])
+            _ed = date_cls.fromisoformat(event["end_date"] or event["start_date"])
+
+            _ds_conn = get_db_connection()
+            _ds_cur = _ds_conn.cursor()
+            _ds_cur.execute(
+                "SELECT event_date, tickets_sold FROM event_day_stats WHERE event_id = ?",
+                (event_id,)
+            )
+            _day_map = {r["event_date"]: int(r["tickets_sold"] or 0) for r in _ds_cur.fetchall()}
+            _ds_conn.close()
+
+            _current = _sd
+            _all_days_full = True
+            while _current <= _ed:
+                if _day_map.get(_current.isoformat(), 0) < capacity_per_day:
+                    _all_days_full = False
+                    break
+                _current += timedelta(days=1)
+
+            # Only fire once — when this purchase was the one that tipped the last day
+            _day_just_tipped = (day_sold + quantity) >= capacity_per_day and day_sold < capacity_per_day
+
+            if _all_days_full and _day_just_tipped:
+                create_notification(
+                    user_id=event["organizer_id"],
+                    event_id=event_id,
+                    notif_type='ticket',
+                    title='All Days Sold Out',
+                    message='"' + event["name"] + '" is now sold out for all available days.',
+                    send_email_copy=False
+                )
+                firebase_send_notification(
+                    'All Days Sold Out',
+                    '"' + event["name"] + '" is now sold out for all available days.',
+                    event_id,
+                    user_ids=[event["organizer_id"]]
+                )
+                if organizer_contact and organizer_contact["email"]:
+                    send_email(
+                        to_list=[organizer_contact["email"]],
+                        subject=f"{event['name']} — All dates are now sold out",
+                        html_body=f"""
+                        <div style="font-family:sans-serif;max-width:600px;margin:auto;padding:24px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;">
+                          <h2 style="color:#9B1040;margin-top:0;">All Dates Sold Out</h2>
+                          <p>Your event <strong>{event['name']}</strong> is now sold out for all available attendance dates.</p>
+                          <p>Every scheduled day has reached full capacity. No more tickets can be purchased.</p>
+                        </div>
+                        """
+                    )
+                _holders_conn = get_db_connection()
+                _holders_cur = _holders_conn.cursor()
+                _holders = get_crowd_alert_ticket_holders(event_id, _holders_cur)
+                _holders_conn.close()
+                _customer_emails = list(dict.fromkeys([
+                    r["email"] for r in _holders if r["email"] and r["email"] != (organizer_contact["email"] if organizer_contact else None)
+                ]))
+                if _customer_emails:
+                    send_email(
+                        to_list=_customer_emails,
+                        subject=f"All dates sold out — {event['name']}",
+                        html_body=f"""
+                        <div style="font-family:sans-serif;max-width:600px;margin:auto;padding:24px;background:#fff;border:1px solid #e5e7eb;border-radius:12px;">
+                          <h2 style="color:#dc2626;margin-top:0;">All Dates Are Now Sold Out</h2>
+                          <p>All attendance dates for <strong>{event['name']}</strong> have reached full capacity.</p>
+                          <p>No more tickets are available for any date. Your existing ticket is still valid.</p>
+                          <p style="color:#6b7280;font-size:13px;">You received this because you have a ticket for this event.</p>
+                        </div>
+                        """
+                    )
+        except Exception as e:
+            print("Error in all-days-sold-out notification:", e)
 
     return jsonify({
         "message": quantity_label + " purchased successfully",
@@ -5018,6 +5548,7 @@ def buy_ticket(event_id):
         "quantity": quantity,
         "event_name": event["name"],
         "tickets_sold": new_tickets_sold,
+        "attendance_date": attendance_date,
         "crowd_alerts_enabled": bool(crowd_alerts_enabled)
     })
 

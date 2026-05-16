@@ -129,6 +129,7 @@ function renderStaffAlertBanner(eventData) {
 }
 
 function getSelectedScanHistory() {
+  loadScanHistoryFromStorage();
   var selectedEvent = getSelectedStaffEvent();
   var eventId = selectedEvent && selectedEvent.id != null ? String(selectedEvent.id) : 'default';
   return state.scanHistoryByEvent && state.scanHistoryByEvent[eventId]
@@ -136,12 +137,32 @@ function getSelectedScanHistory() {
     : [];
 }
 
+function saveScanHistoryToStorage() {
+  try {
+    localStorage.setItem('scanHistoryByEvent', JSON.stringify(state.scanHistoryByEvent || {}));
+  } catch (e) {}
+}
+
+function loadScanHistoryFromStorage() {
+  try {
+    var raw = localStorage.getItem('scanHistoryByEvent');
+    if (raw) {
+      var parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') {
+        state.scanHistoryByEvent = parsed;
+      }
+    }
+  } catch (e) {}
+}
+
 function addScanHistoryEntry(eventId, entry) {
   if (eventId == null) return;
+  loadScanHistoryFromStorage();
   state.scanHistoryByEvent = state.scanHistoryByEvent || {};
   var key = String(eventId);
   var current = Array.isArray(state.scanHistoryByEvent[key]) ? state.scanHistoryByEvent[key] : [];
   state.scanHistoryByEvent[key] = [entry].concat(current).slice(0, 40);
+  saveScanHistoryToStorage();
 }
 
 function renderScanHistory(entries) {
@@ -252,9 +273,14 @@ function renderScan() {
   var currentEvent = getSelectedStaffEvent();
   var selectedEventId = currentEvent ? currentEvent.id : null;
 
-  var attendanceCount = currentEvent ? Number(currentEvent.attendance_count || 0) : 0;
+  var attendanceCount = currentEvent
+    ? Number(currentEvent.today_attendance_count !== undefined ? currentEvent.today_attendance_count : currentEvent.attendance_count || 0)
+    : 0;
+  var todayCapacity = currentEvent
+    ? Number(currentEvent.today_capacity !== undefined ? currentEvent.today_capacity : currentEvent.capacity || 0)
+    : 0;
   var ticketsSold = currentEvent ? Number(currentEvent.tickets_sold || 0) : 0;
-  var remainingEntries = currentEvent ? Math.max(Number(currentEvent.capacity || 0) - attendanceCount, 0) : 0;
+  var remainingEntries = todayCapacity > 0 ? Math.max(todayCapacity - attendanceCount, 0) : 0;
   var evName = currentEvent ? currentEvent.name : 'Select Event';
   var runtime = getEventRuntimeState(currentEvent);
   var entryLocked = !!(currentEvent && currentEvent.entry_locked);
@@ -367,9 +393,9 @@ function renderScan() {
       /* Stats row */
       '<div style="width:100%;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;" id="scan-stats">' +
         [
-          { label:'Tickets Sold', val: ticketsSold,      color: '#9B1040' },
-          { label:'Attendance',   val: attendanceCount,  color: '#22C55E' },
-          { label:'Remaining',    val: remainingEntries, color: '#F59E0B' }
+          { label:'Tickets Sold',         val: ticketsSold,      color: '#9B1040' },
+          { label:"Today's Attendance",   val: attendanceCount,  color: '#22C55E' },
+          { label:'Remaining Today',      val: remainingEntries, color: '#F59E0B' }
         ].map(function(s) {
           return '<div class="stat-card" style="text-align:center;padding:14px 8px;">' +
             '<div style="font-family:\'Montserrat\',sans-serif;font-weight:900;font-size:26px;color:' + s.color + ';margin-bottom:3px;">' + s.val + '</div>' +
@@ -940,6 +966,10 @@ async function validateTicket() {
         if (Number(ev.id) !== Number(selectedEventId)) return ev;
         return Object.assign({}, ev, {
           attendance_count: data.attendance_count,
+          today_attendance_count: data.today_attendance_count !== undefined
+            ? data.today_attendance_count
+            : (ev.today_attendance_count !== undefined ? ev.today_attendance_count + 1 : ev.attendance_count + 1),
+          today_capacity: data.today_capacity !== undefined ? data.today_capacity : ev.today_capacity,
           crowd_level: data.crowd_level,
           tickets_sold: data.tickets_sold,
           prediction: data.prediction || ev.prediction,
@@ -960,6 +990,8 @@ async function validateTicket() {
       if (typeof applyRealtimeEventUpdate === 'function') {
         applyRealtimeEventUpdate(selectedEventId, {
           attendance_count: data.attendance_count,
+          today_attendance_count: data.today_attendance_count,
+          today_capacity: data.today_capacity,
           crowd_level: data.crowd_level,
           tickets_sold: data.tickets_sold,
           capacity: selectedEvent ? selectedEvent.capacity : 0,
@@ -977,13 +1009,14 @@ async function validateTicket() {
         resultEl = document.getElementById('scan-result');
       }
 
+      var displayAttendance = data.today_attendance_count !== undefined ? data.today_attendance_count : data.attendance_count;
       var successOptions = {
         tone: 'success',
         icon: 'OK',
         title: 'VALID TICKET',
         detail: (data.ticket_code || '') + (data.customer_name ? ' - ' + data.customer_name : ''),
         reason: 'Ticket verified successfully',
-        meta: 'Attendance: ' + data.attendance_count + ' | Crowd Level: ' + data.crowd_level + ' | Ticket Status: ' + (data.ticket_status || 'Done')
+        meta: "Today's Attendance: " + displayAttendance + ' | Crowd Level: ' + data.crowd_level + ' | Ticket Status: ' + (data.ticket_status || 'Done')
       };
       setScanResultCard(resultEl, successOptions);
       addScanHistoryEntry(selectedEventId, mapScanOutcomeToHistory(data.ticket_code || code, successOptions));
@@ -1008,6 +1041,15 @@ async function validateTicket() {
       };
       setScanResultCard(resultEl, blockedOptions);
       addScanHistoryEntry(selectedEventId, mapScanOutcomeToHistory(code, blockedOptions));
+      refreshScanHistoryPanel();
+    } else if (data.reason_code === 'ticket_wrong_date') {
+      var wrongDateOptions = {
+        title: 'WRONG DATE',
+        reason: 'This ticket is not valid for today',
+        meta: data.message || 'The ticket is booked for a different date.'
+      };
+      setScanResultCard(resultEl, wrongDateOptions);
+      addScanHistoryEntry(selectedEventId, mapScanOutcomeToHistory(code, wrongDateOptions));
       refreshScanHistoryPanel();
     } else {
       var serverMessage = data.message || 'Ticket not found';
@@ -1065,14 +1107,19 @@ function renderScanStats(selectedEventId) {
     return Number(ev.id) === Number(selectedEventId);
   });
 
-  var attendanceCount = eventData ? Number(eventData.attendance_count || 0) : 0;
+  var attendanceCount = eventData
+    ? Number(eventData.today_attendance_count !== undefined ? eventData.today_attendance_count : eventData.attendance_count || 0)
+    : 0;
+  var todayCapacity = eventData
+    ? Number(eventData.today_capacity !== undefined ? eventData.today_capacity : eventData.capacity || 0)
+    : 0;
   var ticketsSold = eventData ? Number(eventData.tickets_sold || 0) : 0;
-  var remainingEntries = eventData ? Math.max(Number(eventData.capacity || 0) - attendanceCount, 0) : 0;
+  var remainingEntries = todayCapacity > 0 ? Math.max(todayCapacity - attendanceCount, 0) : 0;
 
   statsEl.innerHTML = [
-    { label:'Tickets Sold', val: ticketsSold, color: '#9B1040' },
-    { label:'Attendance', val: attendanceCount, color: '#22C55E' },
-    { label:'Remaining', val: remainingEntries, color: '#F59E0B' }
+    { label:'Tickets Sold',       val: ticketsSold,      color: '#9B1040' },
+    { label:"Today's Attendance", val: attendanceCount,  color: '#22C55E' },
+    { label:'Remaining Today',    val: remainingEntries, color: '#F59E0B' }
   ].map(function(s) {
     return '<div class="stat-card" style="text-align:center;padding:16px;">' +
       '<div style="font-weight:900;font-size:28px;color:' + s.color + ';">' + s.val + '</div>' +

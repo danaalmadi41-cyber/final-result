@@ -152,7 +152,17 @@ function renderDetail() {
 
   var mode = state.detailViewMode || 'current';
   var prediction = ev.prediction || {};
-  var pct = ev.capacity > 0 ? Math.round((Number(ev.attendance_count || 0) / Number(ev.capacity || 0)) * 100) : 0;
+  var capacityPerDay = Number(ev.capacity_per_day || 0);
+  var totalCapacity;
+  if (capacityPerDay > 0 && ev.start_date && ev.end_date && ev.start_date !== ev.end_date) {
+    var sdCap = new Date(ev.start_date + 'T00:00:00');
+    var edCap = new Date(ev.end_date + 'T00:00:00');
+    var numDaysCap = Math.max(Math.round((edCap - sdCap) / 86400000) + 1, 1);
+    totalCapacity = capacityPerDay * numDaysCap;
+  } else {
+    totalCapacity = Number(ev.capacity || 0);
+  }
+  var pct = totalCapacity > 0 ? Math.round((Number(ev.attendance_count || 0) / totalCapacity) * 100) : 0;
   var predictedPeakPercent = Number(prediction.predicted_peak_percent || pct);
   var predictedPeakAttendance = Number(prediction.predicted_peak_attendance || prediction.predicted_final_attendance || 0);
   var crowdLevel = (ev.crowd_level || 'low').toLowerCase();
@@ -196,9 +206,8 @@ function renderDetail() {
                 '<p class="event-detail-hero-copy" style="color:#f6e6eb;line-height:1.8;font-size:15px;">' + (ev.description || 'No description available for this event yet.') + '</p>' +
               '</div>' +
             '</div>' +
-            '<div class="event-detail-hero-stats" style="display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;">' +
-              renderDetailHeroStat('Tickets Sold', Number(ev.tickets_sold || 0).toLocaleString()) +
-              renderDetailHeroStat('Capacity', Number(ev.capacity || 0).toLocaleString()) +
+            '<div class="event-detail-hero-stats" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;">' +
+              renderDetailHeroStat('Total Capacity', totalCapacity.toLocaleString()) +
               renderDetailHeroStat('Current Attendance', Number(ev.attendance_count || 0).toLocaleString()) +
               renderDetailHeroStat('Current Crowd', pct + '%') +
             '</div>' +
@@ -223,8 +232,7 @@ function renderDetail() {
               (mode === 'current'
                 ? [
                     renderEventMetricTile('Current Attendance', Number(ev.attendance_count || 0).toLocaleString()),
-                    renderEventMetricTile('Tickets Sold', Number(ev.tickets_sold || 0).toLocaleString()),
-                    renderEventMetricTile('Capacity', Number(ev.capacity || 0).toLocaleString()),
+                    renderEventMetricTile('Total Capacity', totalCapacity.toLocaleString()),
                     renderEventMetricTile('Live Crowd Level', levelBadge(crowdLevel))
                   ].join('')
                 : [
@@ -253,13 +261,12 @@ function renderDetail() {
             '<div class="event-detail-analysis-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin-bottom:16px;">' +
               renderCrowdAnalysisCard('Current Crowd', levelBadge(crowdLevel), 'Live attendance is at ' + pct + '% of capacity right now.') +
               renderCrowdAnalysisCard('Prediction', levelBadge(predictedCrowdLevel), 'Expected peak is ' + predictedPeakPercent + '% of capacity.') +
-              renderCrowdAnalysisCard('Available Tickets', remainingTickets.toLocaleString(), 'Tickets still available for customers.') +
+              renderCrowdAnalysisCard('Available Tickets', remainingTickets != null ? remainingTickets.toLocaleString() : 'N/A', 'Tickets still available for customers.') +
             '</div>' +
             '<div class="event-detail-info-grid" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;">' +
               renderInfoGridItem('Event Date', eventDateText) +
               renderInfoGridItem('Event Time', eventTimeText) +
               renderInfoGridItem('Event Location', eventLocationText) +
-              renderInfoGridItem('Tickets Sold', Number(ev.tickets_sold || 0).toLocaleString() + ' / ' + Number(ev.capacity || 0).toLocaleString()) +
               renderInfoGridItem('Current Attendance', Number(ev.attendance_count || 0).toLocaleString()) +
             '</div>' +
           '</div>' +
@@ -281,7 +288,7 @@ function renderDetail() {
             '<div class="event-detail-side-list" style="display:flex;flex-direction:column;gap:10px;margin-bottom:20px;">' +
               detailListRow('Current Attendance', Number(ev.attendance_count || 0).toLocaleString()) +
               detailListRow('Predicted Peak', predictedPeakAttendance.toLocaleString()) +
-              detailListRow('Capacity', Number(ev.capacity || 0).toLocaleString()) +
+              detailListRow('Total Capacity', totalCapacity.toLocaleString()) +
             '</div>' +
             '<button class="btn-primary" style="' + buyButtonStyle + '" onclick="buyTicket(' + ev.id + ')"' + ((runtime.isEnded || runtime.isSoldOut) ? ' disabled' : '') + '>' + buyButtonLabel + '</button>' +
             eventStatusNote +
@@ -615,10 +622,13 @@ window.initEventDetailPage = initEventDetailPage;
 //  BEST TIME TO VISIT — ML prediction
 // ============================================================
 
-function loadBestVisitTime(eventId) {
+function loadBestVisitTime(eventId, forceRefresh) {
   if (!eventId) return;
   state.bestVisitPrediction = state.bestVisitPrediction || {};
-  if (state.bestVisitPrediction[eventId] && state.bestVisitPrediction[eventId]._loading) return;
+
+  var existing = state.bestVisitPrediction[eventId];
+  if (!forceRefresh && existing && existing._loading) return;
+  if (!forceRefresh && existing && !existing._error && !existing._loading) return;
 
   state.bestVisitPrediction[eventId] = { _loading: true };
 
@@ -779,18 +789,14 @@ function buyTicket(eventId) {
 }
 window.buyTicket = buyTicket;
 
-function openPaymentModal(eventId, crowdAlertsDefault) {
+async function openPaymentModal(eventId, crowdAlertsDefault) {
   var existing = document.getElementById('payment-modal');
   if (existing) existing.remove();
 
   var ev = (state.realEvents || []).find(function(item) {
     return Number(item.id) === Number(eventId);
   }) || null;
-  var remainingTickets = ev
-    ? getEventRuntimeState(ev).remainingTickets
-    : 1;
   var runtime = getEventRuntimeState(ev);
-  var maxSelectableTickets = Math.max(Math.min(remainingTickets, 10), 1);
 
   if (runtime.isEnded) {
     showToast('Event has ended', 'error');
@@ -802,8 +808,41 @@ function openPaymentModal(eventId, crowdAlertsDefault) {
     return;
   }
 
+  var capacityPerDay = Number(ev && ev.capacity_per_day || 0);
+  var isMultiDay = !!(ev && ev.start_date && ev.end_date && ev.start_date !== ev.end_date);
+  var needsDayPicker = capacityPerDay > 0 && isMultiDay;
+
+  var dayPickerHtml = '';
+  var initialMax = runtime.remainingTickets != null ? Math.max(Math.min(runtime.remainingTickets, 10), 1) : 10;
+
+  if (needsDayPicker) {
+    var daysData = null;
+    try {
+      var daysResp = await fetch('/api/events/' + eventId + '/days');
+      daysData = daysResp.ok ? await daysResp.json() : null;
+    } catch (e) { daysData = null; }
+
+    var dayOptions = '<option value="" data-remaining="0">-- Select attendance date --</option>';
+    if (daysData && daysData.days && daysData.days.length) {
+      daysData.days.forEach(function(d) {
+        var label = d.is_sold_out
+          ? (d.day_name + ' — ' + d.date_display + ' — Sold Out')
+          : (d.day_name + ' — ' + d.date_display + ' — ' + d.remaining + ' ticket' + (d.remaining === 1 ? '' : 's') + ' left');
+        dayOptions += '<option value="' + d.date + '" data-remaining="' + d.remaining + '"' + (d.is_sold_out ? ' disabled' : '') + '>' + label + '</option>';
+      });
+    }
+    dayPickerHtml =
+      '<div>' +
+        '<label class="field-label">Attendance Date</label>' +
+        '<select class="input-field" id="pay-day" onchange="onPaymentDayChange(' + capacityPerDay + ')">' + dayOptions + '</select>' +
+      '</div>';
+    initialMax = Math.min(capacityPerDay, 10);
+  }
+
+  var maxSelectableTickets = Math.max(initialMax, 1);
+
   var modal =
-    '<div id="payment-modal" class="payment-modal-shell" onclick="handlePaymentOverlayClick(event)" style="position:fixed;inset:0;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;z-index:3000;padding:18px;">' +
+    '<div id="payment-modal" class="payment-modal-shell" onclick="handlePaymentOverlayClick(event)" style="position:fixed;inset:0;background:rgba(0,0,0,0.65);display:flex;align-items:center;justify-content:center;z-index:3000;padding:18px;overflow:auto;">' +
       '<div class="card payment-modal-card" style="width:100%;max-width:560px;padding:24px;">' +
         '<div class="payment-modal-head">' +
           '<button class="payment-close-btn" onclick="closePaymentModal()" aria-label="Close purchase details">&times;</button>' +
@@ -814,6 +853,7 @@ function openPaymentModal(eventId, crowdAlertsDefault) {
           '</div>' +
         '</div>' +
         '<div style="display:flex;flex-direction:column;gap:14px;">' +
+          dayPickerHtml +
           '<div><label class="field-label">Number of Tickets</label><input type="number" class="input-field" id="pay-quantity" min="1" max="' + maxSelectableTickets + '" value="1" inputmode="numeric" /></div>' +
           '<div><label class="field-label">Cardholder Name</label><input type="text" class="input-field" id="pay-name" placeholder="Name on card" autocomplete="cc-name" /></div>' +
           '<div><label class="field-label">Card Number</label><input type="text" class="input-field" id="pay-number" placeholder="1234567890123456" inputmode="numeric" autocomplete="cc-number" maxlength="19" /></div>' +
@@ -822,7 +862,7 @@ function openPaymentModal(eventId, crowdAlertsDefault) {
             '<div><label class="field-label">CVV</label><input type="text" class="input-field" id="pay-cvv" placeholder="123" inputmode="numeric" autocomplete="cc-csc" maxlength="3" /></div>' +
           '</div>' +
         '</div>' +
-        '<div class="payment-confirm-note">' +
+        '<div class="payment-confirm-note" id="pay-confirm-note">' +
           'You can buy up to ' + maxSelectableTickets + ' ticket' + (maxSelectableTickets === 1 ? '' : 's') + ' in one purchase. Press confirm to receive your ticket code and barcode' + (maxSelectableTickets === 1 ? '' : 's') + ' immediately.' +
         '</div>' +
         '<div style="display:flex;justify-content:flex-end;gap:10px;margin-top:22px;">' +
@@ -836,6 +876,30 @@ function openPaymentModal(eventId, crowdAlertsDefault) {
   setupPaymentModalFields();
 }
 window.openPaymentModal = openPaymentModal;
+
+function onPaymentDayChange(capacityPerDay) {
+  var select = document.getElementById('pay-day');
+  var qtyInput = document.getElementById('pay-quantity');
+  var note = document.getElementById('pay-confirm-note');
+  if (!select) return;
+
+  var selectedOption = select.options[select.selectedIndex];
+  var remaining = selectedOption ? parseInt(selectedOption.getAttribute('data-remaining') || '0', 10) : 0;
+  var newMax = Math.max(Math.min(remaining, 10), 1);
+
+  if (qtyInput) {
+    qtyInput.max = newMax;
+    if (Number(qtyInput.value) > newMax) qtyInput.value = newMax;
+    if (!qtyInput.value || Number(qtyInput.value) < 1) qtyInput.value = 1;
+  }
+
+  if (note) {
+    note.textContent = select.value
+      ? 'You can buy up to ' + newMax + ' ticket' + (newMax === 1 ? '' : 's') + ' for this date. Press confirm to receive your ticket code and barcode' + (newMax === 1 ? '' : 's') + ' immediately.'
+      : 'Select an attendance date to continue.';
+  }
+}
+window.onPaymentDayChange = onPaymentDayChange;
 
 function setupPaymentModalFields() {
   var quantityInput = document.getElementById('pay-quantity');
@@ -958,11 +1022,18 @@ async function confirmPayment(eventId) {
   var cardNumber = document.getElementById('pay-number');
   var expiry = document.getElementById('pay-expiry');
   var cvv = document.getElementById('pay-cvv');
+  var daySelect = document.getElementById('pay-day');
   var crowdAlertsEnabled = !state.user || state.user.role !== 'customer' || state.user.notifications_enabled !== false;
   var quantity = quantityInput ? Number(quantityInput.value || 0) : 0;
+  var attendanceDate = daySelect ? (daySelect.value || '') : '';
 
   if (!quantityInput || !cardName || !cardNumber || !expiry || !cvv) {
     showToast('Payment form is incomplete', 'error');
+    return;
+  }
+
+  if (daySelect && !attendanceDate) {
+    showToast('Please select your attendance date', 'error');
     return;
   }
 
@@ -1016,14 +1087,17 @@ async function confirmPayment(eventId) {
   }
 
   try {
+    var buyBody = {
+      user_id: state.user.id,
+      quantity: quantity,
+      crowd_alerts_enabled: crowdAlertsEnabled
+    };
+    if (attendanceDate) buyBody.attendance_date = attendanceDate;
+
     var response = await fetch('/api/events/' + eventId + '/buy', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        user_id: state.user.id,
-        quantity: quantity,
-        crowd_alerts_enabled: crowdAlertsEnabled
-      })
+      body: JSON.stringify(buyBody)
     });
 
     var data = await response.json();

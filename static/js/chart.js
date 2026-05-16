@@ -2,10 +2,14 @@
 var WEEKDAY_LABELS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
 // Convert a date string into the weekday name used on the chart axis.
+// Parses YYYY-MM-DD components directly to avoid UTC-offset weekday errors.
 function getDayOfWeek(dateStr) {
   if (!dateStr) return '';
 
-  var date = new Date(dateStr);
+  var parts = String(dateStr).split('-');
+  if (parts.length < 3) return '';
+
+  var date = new Date(parseInt(parts[0], 10), parseInt(parts[1], 10) - 1, parseInt(parts[2], 10));
   if (isNaN(date.getTime())) return '';
 
   return WEEKDAY_LABELS[date.getDay()];
@@ -21,7 +25,8 @@ function getEventChartDate(ev) {
 // Pick a safe Y-axis max using event capacity, chart data, and a minimum fallback.
 function getAttendanceAxisMax(events, fallbackMax) {
   var maxCapacity = (events || []).reduce(function(max, ev) {
-    return Math.max(max, Number(ev.capacity || 0));
+    var cap = ev.today_capacity !== undefined ? Number(ev.today_capacity) : Number(ev.capacity || 0);
+    return Math.max(max, cap);
   }, 0);
 
   return Math.max(Number(fallbackMax || 0), maxCapacity, 1);
@@ -41,14 +46,28 @@ function createEmptyWeekdayMap() {
 }
 
 // Build weekday totals for any event metric passed in through the resolver.
+// For multi-day events, only TODAY's attendance is used so historical days never appear in Current View.
 function buildWeekdaySeries(events, valueResolver) {
   var weekdayData = createEmptyWeekdayMap();
 
   (events || []).forEach(function(ev) {
-    var dayOfWeek = getDayOfWeek(getEventChartDate(ev));
-    if (!dayOfWeek || !weekdayData.hasOwnProperty(dayOfWeek)) return;
+    var cpd = Number(ev.capacity_per_day || 0);
 
-    weekdayData[dayOfWeek] += Number(valueResolver(ev) || 0);
+    if (cpd > 0) {
+      // Multi-day: only plot today's attendance at today's weekday
+      var _dn = new Date();
+      var _df = _dn.getFullYear() + '-' + String(_dn.getMonth() + 1).padStart(2, '0') + '-' + String(_dn.getDate()).padStart(2, '0');
+      var todayDate = ev.today_date || _df;
+      var todayAtt = ev.today_attendance_count !== undefined ? Number(ev.today_attendance_count) : 0;
+      var dayOfWeek = getDayOfWeek(todayDate);
+      if (dayOfWeek && weekdayData.hasOwnProperty(dayOfWeek)) {
+        weekdayData[dayOfWeek] += todayAtt;
+      }
+    } else {
+      var dayOfWeek = getDayOfWeek(getEventChartDate(ev));
+      if (!dayOfWeek || !weekdayData.hasOwnProperty(dayOfWeek)) return;
+      weekdayData[dayOfWeek] += Number(valueResolver(ev) || 0);
+    }
   });
 
   return WEEKDAY_LABELS.map(function(day) {
@@ -57,20 +76,45 @@ function buildWeekdaySeries(events, valueResolver) {
 }
 
 // For a single event, place its value on the correct weekday and leave the rest at zero.
+// Current mode: always shows only TODAY's real attendance so past days never pollute the live view.
+// Prediction mode: shows the forecast value at today's weekday.
 function buildSingleEventWeekdaySeries(eventData, mode) {
   var series = WEEKDAY_LABELS.map(function() { return 0; });
   if (!eventData) return series;
 
-  var dayOfWeek = getDayOfWeek(getEventChartDate(eventData));
-  var dayIndex = WEEKDAY_LABELS.indexOf(dayOfWeek);
-  if (dayIndex === -1) return series;
+  var cpd = Number(eventData.capacity_per_day || 0);
 
+  if (mode === 'current') {
+    // Always use today's attendance regardless of whether this is a multi-day or single-day event.
+    var _now = new Date();
+    var _localFallback = _now.getFullYear() + '-' + String(_now.getMonth() + 1).padStart(2, '0') + '-' + String(_now.getDate()).padStart(2, '0');
+    var todayDate = eventData.today_date || _localFallback;
+    var dayOfWeek = getDayOfWeek(todayDate);
+    var dayIndex = WEEKDAY_LABELS.indexOf(dayOfWeek);
+    if (dayIndex === -1) {
+      dayOfWeek = getDayOfWeek(getEventChartDate(eventData));
+      dayIndex = WEEKDAY_LABELS.indexOf(dayOfWeek);
+    }
+    if (dayIndex !== -1) {
+      series[dayIndex] = Number(
+        eventData.today_attendance_count !== undefined
+          ? eventData.today_attendance_count
+          : eventData.attendance_count || 0
+      );
+    }
+    return series;
+  }
+
+  // Prediction mode
   var prediction = eventData.prediction || {};
-  var value = mode === 'prediction'
-    ? Number(prediction.predicted_peak_attendance || prediction.predicted_final_attendance || 0)
-    : Number(eventData.attendance_count || 0);
+  var predictedValue = Number(prediction.predicted_peak_attendance || prediction.predicted_final_attendance || 0);
 
-  series[dayIndex] = value;
+  var targetDate = (cpd > 0 && eventData.today_date) ? eventData.today_date : getEventChartDate(eventData);
+  var dayOfWeek = getDayOfWeek(targetDate);
+  var dayIndex = WEEKDAY_LABELS.indexOf(dayOfWeek);
+  if (dayIndex !== -1) {
+    series[dayIndex] = predictedValue;
+  }
   return series;
 }
 
@@ -236,7 +280,10 @@ function initEventDetailAttendanceChart(canvasId, eventData, mode) {
   if (!eventData) return;
 
   var data = buildSingleEventWeekdaySeries(eventData, mode);
-  var yAxisMax = Math.max(Number(eventData.capacity || 0), Math.max.apply(null, data), 1);
+  var effectiveCapacity = eventData.today_capacity !== undefined
+    ? Number(eventData.today_capacity)
+    : Number(eventData.capacity || 0);
+  var yAxisMax = Math.max(effectiveCapacity, Math.max.apply(null, data), 1);
   var colors = mode === 'prediction'
     ? 'rgba(168, 121, 86, 0.88)'
     : 'rgba(122, 84, 62, 0.88)';
